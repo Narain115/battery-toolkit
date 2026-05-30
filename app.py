@@ -59,7 +59,7 @@ with st.sidebar:
         "defibrillators (ICD) at Purdue University."
     )
     st.markdown("---")
-st.markdown(
+    st.markdown(
         "[![GitHub](https://img.shields.io/badge/GitHub-Narain115-f59e0b?"
         "style=flat&logo=github)](https://github.com/Narain115/battery-toolkit)"
     )
