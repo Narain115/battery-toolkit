@@ -1,392 +1,454 @@
 """
 Module 2: Electrochemical Impedance Spectroscopy (EIS) Analysis
 ===============================================================
-Equivalent circuit fitting and degradation tracking via impedance.
+Uses REAL NASA PCOE Battery Dataset — impedance measurements.
+NASA Ames Research Center, Prognostics Center of Excellence.
 
-Context: For implantable cardiac defibrillators (ICD), EIS is used
-during battery qualification protocols. Rising charge transfer
-resistance (Rct) indicates SEI thickening. This module replicates
-the electrochemical characterization workflow used before a battery
-is cleared for implantation.
+Dataset: B0005, B0006, B0007, B0018
+- 278 real EIS measurements per cell across full cycle life
+- EIS frequency sweep: 0.1 Hz to 5 kHz
+- Randles circuit parameters extracted by NASA:
+    Re  = electrolyte/ohmic resistance (Ohms)
+    Rct = charge transfer resistance (Ohms)
+- Full complex impedance spectrum per measurement
 
-Key insight: Impedance rise PRECEDES capacity fade by hundreds of
-cycles. For a device with a 7-10 year design life inside a human
-body, early detection of degradation is the only clinically
-meaningful detection.
+Source:
+    Saha, B. & Goebel, K. (2007). Battery Data Set.
+    NASA Ames Prognostics Data Repository.
 
-Dataset: Physics-informed synthetic EIS data calibrated to:
-- NASA PCOE Battery Dataset, cells B0005-B0018
-  Saha, B. & Goebel, K. (2007). NASA Ames Prognostics Data Repository.
-- Degradation rates from:
-  Birkl, C.R. et al. (2017). Degradation diagnostics for lithium ion
-  cells. Journal of Power Sources, 341, 373-386.
-
-Randles Circuit Model:
-    Rs ── [Rct || Cdl] ── W
-    
-    Rs  = ohmic/solution resistance (SEI layer dominates)
-    Rct = charge transfer resistance at electrode surface
-    Cdl = double layer capacitance
-    W   = Warburg diffusion (solid-state Li+ diffusion)
+ICD Context:
+    EIS is used in battery qualification protocols for implantable
+    devices. Rising charge transfer resistance (Rct) indicates SEI
+    thickening and active material loss. Impedance rise PRECEDES
+    capacity fade by many cycles — for a 7-10 year implanted device,
+    early detection is the only clinically meaningful detection.
 """
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import warnings
 import os
+import scipy.io as sio
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
 
 
 # ─────────────────────────────────────────────
-# STEP 1: GENERATE PHYSICS-INFORMED EIS DATA
+# STEP 1: LOAD REAL NASA EIS DATA
 # ─────────────────────────────────────────────
 
-def randles_impedance(freq, Rs, Rct, Cdl, W_coeff):
+def load_eis_data(filepath, cell_name):
     """
-    Compute complex impedance of Randles circuit with Warburg element.
-    
-    Z(ω) = Rs + 1 / (jωCdl + 1/(Rct + W(ω)))
-    
-    Warburg element (semi-infinite diffusion):
-    Z_W = W_coeff / sqrt(jω) = W_coeff/sqrt(ω) * (1 - j) / sqrt(2)
-    
-    Parameters:
-        freq   : frequency array (Hz)
-        Rs     : ohmic resistance (Ω) — SEI + electrolyte
-        Rct    : charge transfer resistance (Ω)
-        Cdl    : double layer capacitance (F)
-        W_coeff: Warburg coefficient (Ω/sqrt(rad/s))
-    
-    Returns:
-        Z : complex impedance array
+    Load real EIS measurements from NASA .mat file.
+
+    For each impedance cycle extracts:
+    - Re:  electrolyte resistance (Ohms)
+    - Rct: charge transfer resistance (Ohms)
+    - Full complex Battery_impedance spectrum
+    - Cycle index within the full experiment
+
+    Also loads discharge capacity to correlate
+    impedance rise with capacity fade.
     """
-    omega = 2 * np.pi * freq
-    
-    # Warburg impedance (solid-state diffusion)
-    Z_W = (W_coeff / np.sqrt(omega)) * (1 - 1j) / np.sqrt(2)
-    
-    # Parallel RC + Warburg
-    Z_faradaic = Rct + Z_W
-    Z_parallel = 1 / (1j * omega * Cdl + 1 / Z_faradaic)
-    
-    # Total impedance
-    Z = Rs + Z_parallel
-    
-    return Z
+    mat = sio.loadmat(filepath)
+    battery = mat[cell_name]
+    cycles = battery['cycle'][0, 0]
+
+    impedance_data = []
+    discharge_data = []
+    discharge_count = 0
+    impedance_count = 0
+
+    for i in range(cycles.shape[1]):
+        cycle_type = str(cycles[0, i]['type'][0])
+        data = cycles[0, i]['data'][0, 0]
+
+        if cycle_type == 'discharge':
+            discharge_count += 1
+            capacity = float(data['Capacity'][0, 0])
+            discharge_data.append({
+                'discharge_cycle': discharge_count,
+                'capacity_Ah': capacity,
+                'cycle_index': i
+            })
+
+        elif cycle_type == 'impedance':
+            impedance_count += 1
+
+            # Real measured Re and Rct from NASA
+            Re  = float(data['Re'][0, 0])
+            Rct = float(data['Rct'][0, 0])
+
+            # Full complex impedance spectrum
+            Z_complex = data['Battery_impedance'].flatten()
+
+            impedance_data.append({
+                'impedance_count': impedance_count,
+                'cycle_index': i,
+                'Re': Re,
+                'Rct': Rct,
+                'Z_real': Z_complex.real,
+                'Z_imag': Z_complex.imag
+            })
+
+    df_imp = pd.DataFrame([{
+        'impedance_count': d['impedance_count'],
+        'cycle_index':     d['cycle_index'],
+        'Re':              d['Re'],
+        'Rct':             d['Rct']
+    } for d in impedance_data])
+
+    df_dis = pd.DataFrame(discharge_data)
+
+    # Store full spectra separately
+    spectra = [(d['impedance_count'],
+                d['Z_real'],
+                d['Z_imag'])
+               for d in impedance_data]
+
+    return df_imp, df_dis, spectra
 
 
-def generate_nasa_eis_dataset(n_cycles=150, cycles_per_measurement=5):
+def load_all_eis():
     """
-    Generate synthetic EIS data calibrated to NASA PCOE B0005-B0018.
-    
-    Degradation parameter evolution (Birkl et al. 2017):
-    
-    Rs evolution:   Rs(n) = Rs0 + k_Rs * n^0.5
-        - SEI growth follows square-root time law (diffusion limited)
-        - Rs0 ≈ 0.05 Ω (initial, NASA B0005 measured value)
-        - k_Rs ≈ 0.0008 Ω/cycle^0.5
-    
-    Rct evolution:  Rct(n) = Rct0 * exp(k_Rct * n)
-        - Exponential growth as active material degrades
-        - Rct0 ≈ 0.12 Ω (initial, NASA B0005)
-        - k_Rct ≈ 0.003 per cycle
-    
-    Cdl evolution:  Cdl(n) = Cdl0 * (1 - k_Cdl * n)
-        - Slight decrease as electrochemically active area reduces
-        - Cdl0 ≈ 0.025 F
-    
-    Capacity evolution: C(n) = C0 * exp(-k_C * n)
-        - Exponential capacity fade (NASA dataset characteristic)
-        - C0 = 1.8 Ah (NASA 18650 cells)
-        - k_C ≈ 0.002 per cycle
+    Load EIS data for all 4 NASA cells.
     """
-    
-    # Frequency range: 0.01 Hz to 10 kHz (standard EIS range)
-    freq = np.logspace(-2, 4, 60)
-    
-    # Measurement cycle numbers
-    measurement_cycles = np.arange(0, n_cycles, cycles_per_measurement)
-    
-    data = []
-    
-    # Initial parameter values calibrated to NASA B0005
-    Rs0    = 0.050   # Ω  — initial ohmic resistance
-    Rct0   = 0.120   # Ω  — initial charge transfer resistance
-    Cdl0   = 0.025   # F  — initial double layer capacitance
-    W0     = 0.080   # Ω/sqrt(rad/s) — initial Warburg coefficient
-    C0     = 1.800   # Ah — initial capacity (NASA 18650)
-    
-    # Degradation rate constants (Birkl et al. 2017, Table 2)
-    k_Rs   = 0.00080  # SEI growth rate
-    k_Rct  = 0.00300  # Charge transfer degradation rate
-    k_Cdl  = 0.00050  # Active area loss rate
-    k_W    = 0.00040  # Diffusion degradation rate
-    k_C    = 0.00200  # Capacity fade rate
-    
-    for cycle in measurement_cycles:
-        
-        # ── Parameter evolution with cycle number ──────────────────────
-        # Rs: square-root growth (SEI diffusion-limited growth)
-        Rs = Rs0 + k_Rs * np.sqrt(cycle) + np.random.normal(0, 0.001)
-        
-        # Rct: exponential increase (active material loss)
-        Rct = Rct0 * np.exp(k_Rct * cycle * 0.1) + np.random.normal(0, 0.003)
-        
-        # Cdl: linear decrease (electroactive area reduction)
-        Cdl = Cdl0 * max(0.3, 1 - k_Cdl * cycle) + np.random.normal(0, 0.0005)
-        
-        # W: slight increase (solid-state diffusion slowing)
-        W = W0 * (1 + k_W * cycle * 0.5) + np.random.normal(0, 0.002)
-        
-        # Capacity: exponential fade
-        capacity = C0 * np.exp(-k_C * cycle * 0.1) + np.random.normal(0, 0.01)
-        capacity = max(0.5, capacity)
-        
-        # Ensure physically reasonable values
-        Rs  = np.clip(Rs,  0.040, 0.200)
-        Rct = np.clip(Rct, 0.100, 0.800)
-        Cdl = np.clip(Cdl, 0.005, 0.030)
-        W   = np.clip(W,   0.060, 0.300)
-        
-        # ── Compute EIS spectrum ───────────────────────────────────────
-        Z = randles_impedance(freq, Rs, Rct, Cdl, W)
-        
-        # Add measurement noise (realistic EIS noise level: ~0.5%)
-        noise_real = np.random.normal(0, 0.001, size=len(freq))
-        noise_imag = np.random.normal(0, 0.001, size=len(freq))
-        
-        Z_real = Z.real + noise_real
-        Z_imag = Z.imag + noise_imag
-        
-        data.append({
-            'cycle': cycle,
-            'Rs': Rs,
-            'Rct': Rct,
-            'Cdl': Cdl,
-            'W': W,
-            'capacity': capacity,
-            'freq': freq,
-            'Z_real': Z_real,
-            'Z_imag': Z_imag
-        })
-    
-    return data
+    cells = {
+        'B0005': 'data/B0005.mat',
+        'B0006': 'data/B0006.mat',
+        'B0007': 'data/B0007.mat',
+        'B0018': 'data/B0018.mat',
+    }
+
+    all_imp  = {}
+    all_dis  = {}
+    all_spec = {}
+
+    for cell_name, filepath in cells.items():
+        print(f"  Loading {cell_name}...", end="")
+        df_imp, df_dis, spectra = load_eis_data(
+            filepath, cell_name
+        )
+        all_imp[cell_name]  = df_imp
+        all_dis[cell_name]  = df_dis
+        all_spec[cell_name] = spectra
+
+        print(f" {len(df_imp)} EIS measurements | "
+              f"Re: {df_imp['Re'].iloc[0]:.4f} -> "
+              f"{df_imp['Re'].iloc[-1]:.4f} Ohm | "
+              f"Rct: {df_imp['Rct'].iloc[0]:.4f} -> "
+              f"{df_imp['Rct'].iloc[-1]:.4f} Ohm")
+
+    return all_imp, all_dis, all_spec
 
 
 # ─────────────────────────────────────────────
 # STEP 2: GENERATE ALL PLOTS
 # ─────────────────────────────────────────────
 
-def plot_nyquist(data, output_path):
+def plot_nyquist(all_spec, output_path):
     """
-    Nyquist plot: -Im(Z) vs Re(Z) at multiple cycle numbers.
-    
-    The Nyquist plot is the standard EIS visualization.
-    The semicircle diameter = Rct.
-    The x-intercept at high frequency = Rs.
-    The 45-degree line at low frequency = Warburg diffusion.
-    
-    As the cell ages: semicircle grows (Rct increases),
-    and the whole curve shifts right (Rs increases).
-    """
-    fig, ax = plt.subplots(figsize=(10, 7))
-    fig.patch.set_facecolor('#0d1117')
-    ax.set_facecolor('#0d1117')
-    
-    # Select 6 evenly spaced cycle measurements to plot
-    plot_indices = np.linspace(0, len(data)-1, 6, dtype=int)
-    colors = plt.cm.plasma(np.linspace(0.15, 0.9, 6))
-    
-    for idx, color in zip(plot_indices, colors):
-        d = data[idx]
-        cycle = d['cycle']
-        
-        # Only plot the inductive/capacitive arc region (positive -ImZ)
-        mask = -d['Z_imag'] >= -0.01
-        
-        ax.plot(d['Z_real'][mask], -d['Z_imag'][mask],
-                color=color, linewidth=2.0, alpha=0.85,
-                label=f'Cycle {cycle}')
-        
-        # Mark the high-frequency intercept (Rs)
-        hf_idx = np.argmax(d['freq'])
-        ax.scatter(d['Z_real'][hf_idx], -d['Z_imag'][hf_idx],
-                   color=color, s=40, zorder=5)
-    
-    ax.set_xlabel("Re(Z)  [Ω]", color='#e6edf3', fontsize=12)
-    ax.set_ylabel("-Im(Z)  [Ω]", color='#e6edf3', fontsize=12)
-    ax.set_title("Nyquist Plot — EIS Spectra Across Cycle Life\n"
-                 "Semicircle growth = Rct increase (SEI + active material loss)\n"
-                 "Calibrated to NASA PCOE Battery Dataset (Saha & Goebel, 2007)",
-                 color='#e6edf3', fontsize=12, pad=15)
-    
-    ax.tick_params(colors='#e6edf3')
-    for spine in ax.spines.values():
-        spine.set_color('#30363d')
-    ax.legend(facecolor='#161b22', edgecolor='#30363d',
-              labelcolor='#e6edf3', fontsize=10,
-              title='Cycle Number', title_fontsize=10)
-    
-    # Annotations
-    ax.annotate('← Rs (ohmic)\nhigh freq intercept',
-                xy=(0.052, 0.002), xytext=(0.07, 0.025),
-                color='#94a3b8', fontsize=9,
-                arrowprops=dict(arrowstyle='->', color='#94a3b8'))
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight',
-                facecolor='#0d1117')
-    plt.close()
-    print(f"Saved: {output_path}")
+    Real Nyquist plots from NASA impedance measurements.
 
+    Plots full complex impedance spectra at early, mid,
+    and late cycle life for all 4 cells.
 
-def plot_bode(data, output_path):
+    Nyquist plot: -Im(Z) vs Re(Z)
+    - High frequency intercept = Re (ohmic resistance)
+    - Semicircle diameter = Rct (charge transfer)
+    - Low frequency tail = Warburg diffusion
+    As cell ages: semicircle grows, curve shifts right.
     """
-    Bode plot: magnitude and phase vs frequency.
-    Complementary to Nyquist — shows frequency-domain behavior clearly.
-    """
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
     fig.patch.set_facecolor('#0d1117')
-    
-    plot_indices = np.linspace(0, len(data)-1, 5, dtype=int)
-    colors = plt.cm.plasma(np.linspace(0.15, 0.9, 5))
-    
-    for idx, color in zip(plot_indices, colors):
-        d = data[idx]
-        Z_complex = d['Z_real'] + 1j * d['Z_imag']
-        magnitude = np.abs(Z_complex)
-        phase = np.angle(Z_complex, deg=True)
-        
-        ax1.loglog(d['freq'], magnitude, color=color,
-                   linewidth=2.0, alpha=0.85, label=f"Cycle {d['cycle']}")
-        ax2.semilogx(d['freq'], -phase, color=color,
-                     linewidth=2.0, alpha=0.85)
-    
-    for ax in [ax1, ax2]:
+    axes = axes.flatten()
+
+    stage_colors = ['#34d399', '#f97316', '#ef4444']
+    stage_labels = ['Early', 'Mid', 'Late']
+
+    for ax, cell_name in zip(
+            axes, ['B0005', 'B0006', 'B0007', 'B0018']):
         ax.set_facecolor('#0d1117')
+        spectra = all_spec[cell_name]
+        total = len(spectra)
+
+        # Pick early (5%), mid (50%), late (90%)
+        indices = [
+            int(total * 0.05),
+            int(total * 0.50),
+            int(total * 0.90)
+        ]
+        indices = [min(i, total - 1) for i in indices]
+
+        for idx, color, label in zip(
+                indices, stage_colors, stage_labels):
+            count, Z_real, Z_imag = spectra[idx]
+            # Filter to capacitive arc region
+            mask = -Z_imag >= -0.02
+            if mask.sum() > 2:
+                ax.plot(Z_real[mask], -Z_imag[mask],
+                        color=color, linewidth=2.0,
+                        alpha=0.85,
+                        label=f'{label} '
+                              f'(meas. {count})')
+                ax.scatter(Z_real[mask][0],
+                           -Z_imag[mask][0],
+                           color=color, s=50, zorder=5)
+
+        ax.set_xlabel('Re(Z)  [Ohm]',
+                      color='#e6edf3', fontsize=10)
+        ax.set_ylabel('-Im(Z)  [Ohm]',
+                      color='#e6edf3', fontsize=10)
+        ax.set_title(f'{cell_name} — Real Nyquist Plot',
+                     color='#f59e0b', fontsize=11)
         ax.tick_params(colors='#e6edf3')
-        ax.set_xlabel('Frequency (Hz)', color='#e6edf3', fontsize=11)
         for spine in ax.spines.values():
             spine.set_color('#30363d')
-    
-    ax1.set_ylabel('|Z| (Ω)', color='#e6edf3', fontsize=11)
-    ax1.set_title('Bode Plot — Impedance Magnitude & Phase\n'
-                  'Randles Circuit: Rs + (Rct || Cdl) + Warburg',
-                  color='#e6edf3', fontsize=12, pad=10)
-    ax1.legend(facecolor='#161b22', edgecolor='#30363d',
-               labelcolor='#e6edf3', fontsize=9)
-    
-    ax2.set_ylabel('-Phase (°)', color='#e6edf3', fontsize=11)
-    
+        ax.legend(facecolor='#161b22', edgecolor='#30363d',
+                  labelcolor='#e6edf3', fontsize=8)
+
+    fig.suptitle(
+        'Real Nyquist Plots — NASA PCOE EIS Measurements\n'
+        'Semicircle growth = Rct increase (SEI + active '
+        'material loss)\n'
+        'ICD context: impedance qualification protocol '
+        'before implantation',
+        color='#e6edf3', fontsize=12, y=1.02)
+
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight',
-                facecolor='#0d1117')
+    plt.savefig(output_path, dpi=150,
+                bbox_inches='tight', facecolor='#0d1117')
     plt.close()
     print(f"Saved: {output_path}")
 
 
-def plot_parameter_evolution(data, output_path):
+def plot_re_rct_evolution(all_imp, output_path):
     """
-    Track Rs and Rct evolution with cycle number.
-    
-    This is the clinical monitoring plot for ICD context:
-    - Rs increase = SEI layer growing on graphite anode
-    - Rct increase = charge transfer getting harder
-    Both precede measurable capacity fade.
+    Real Re and Rct evolution across cycle life.
+
+    Re  = electrolyte resistance — rises as SEI layer grows
+    Rct = charge transfer resistance — rises as active
+          material degrades
+
+    Both measured directly by NASA EIS equipment.
+    This is the key plot showing impedance precedes
+    capacity fade as an early warning signal.
     """
-    cycles = [d['cycle'] for d in data]
-    Rs_vals = [d['Rs'] for d in data]
-    Rct_vals = [d['Rct'] for d in data]
-    Cdl_vals = [d['Cdl'] for d in data]
-    
-    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     fig.patch.set_facecolor('#0d1117')
-    
-    params = [
-        (Rs_vals,  'Rs — Ohmic Resistance (Ω)',
-         'SEI layer growth\n(square-root kinetics)', '#f97316'),
-        (Rct_vals, 'Rct — Charge Transfer Resistance (Ω)',
-         'Active material loss\n(exponential growth)', '#38bdf8'),
-        (Cdl_vals, 'Cdl — Double Layer Capacitance (F)',
-         'Electroactive area reduction\n(linear decay)', '#34d399'),
+
+    colors = {
+        'B0005': '#f97316',
+        'B0006': '#38bdf8',
+        'B0007': '#34d399',
+        'B0018': '#a855f7'
+    }
+
+    for cell_name, df in all_imp.items():
+        color = colors[cell_name]
+
+        axes[0].plot(df['impedance_count'], df['Re'],
+                     color=color, linewidth=2.0,
+                     alpha=0.85, marker='o',
+                     markersize=2.5, label=cell_name)
+
+        axes[1].plot(df['impedance_count'], df['Rct'],
+                     color=color, linewidth=2.0,
+                     alpha=0.85, marker='o',
+                     markersize=2.5, label=cell_name)
+
+    titles = [
+        'Re (Electrolyte Resistance) vs Measurement Index\n'
+        'SEI layer growth — square-root kinetics',
+        'Rct (Charge Transfer Resistance) vs Measurement Index\n'
+        'Active material loss — exponential growth'
     ]
-    
-    for ax, (vals, ylabel, subtitle, color) in zip(axes, params):
+    ylabels = ['Re (Ohm)', 'Rct (Ohm)']
+
+    for ax, title, ylabel in zip(axes, titles, ylabels):
         ax.set_facecolor('#0d1117')
-        ax.plot(cycles, vals, color=color, linewidth=2.0, alpha=0.9)
-        ax.scatter(cycles[::5], vals[::5], color=color, s=25, zorder=5)
-        
-        ax.set_xlabel('Cycle Number', color='#e6edf3', fontsize=11)
-        ax.set_ylabel(ylabel, color='#e6edf3', fontsize=10)
-        ax.set_title(subtitle, color='#94a3b8', fontsize=10, pad=8)
+        ax.set_xlabel('EIS Measurement Index',
+                      color='#e6edf3', fontsize=11)
+        ax.set_ylabel(ylabel, color='#e6edf3', fontsize=11)
+        ax.set_title(title, color='#e6edf3', fontsize=10)
         ax.tick_params(colors='#e6edf3')
         for spine in ax.spines.values():
             spine.set_color('#30363d')
-    
-    fig.suptitle('Randles Circuit Parameter Evolution vs Cycle Number\n'
-                 'Impedance rise precedes capacity fade — ICD early warning signal',
-                 color='#e6edf3', fontsize=13, y=1.02)
-    
+        ax.legend(facecolor='#161b22', edgecolor='#30363d',
+                  labelcolor='#e6edf3', fontsize=10)
+
+    fig.suptitle(
+        'Real Impedance Parameter Evolution — NASA PCOE Data\n'
+        'Impedance rise precedes capacity fade — '
+        'ICD early warning signal',
+        color='#e6edf3', fontsize=13, y=1.02)
+
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight',
-                facecolor='#0d1117')
+    plt.savefig(output_path, dpi=150,
+                bbox_inches='tight', facecolor='#0d1117')
     plt.close()
     print(f"Saved: {output_path}")
 
 
-def plot_capacity_vs_impedance(data, output_path):
+def plot_impedance_vs_capacity(all_imp, all_dis, output_path):
     """
-    Correlation between impedance parameters and capacity fade.
-    This is the key diagnostic plot: shows that Rct and Rs can
-    predict remaining capacity without running a full discharge test.
-    Critical for ICD monitoring where full discharge is not possible.
+    Correlation between real impedance rise and capacity fade.
+
+    Aligns impedance measurements with nearest discharge cycle
+    to show the relationship between Re, Rct and capacity.
+
+    Key finding: impedance rises before capacity drops below
+    the EOL threshold — giving advance warning of cell failure.
+    Critical for ICD batteries where in-vivo capacity testing
+    is not possible.
     """
-    cycles   = np.array([d['cycle'] for d in data])
-    Rs_vals  = np.array([d['Rs'] for d in data])
-    Rct_vals = np.array([d['Rct'] for d in data])
-    cap_vals = np.array([d['capacity'] for d in data])
-    
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     fig.patch.set_facecolor('#0d1117')
-    
-    # Color points by cycle number
-    scatter_kw = dict(c=cycles, cmap='plasma', s=50, alpha=0.8,
-                      edgecolors='none')
-    
-    sc1 = ax1.scatter(Rs_vals, cap_vals, **scatter_kw)
-    ax1.set_xlabel('Rs — Ohmic Resistance (Ω)', color='#e6edf3', fontsize=11)
-    ax1.set_ylabel('Discharge Capacity (Ah)', color='#e6edf3', fontsize=11)
-    ax1.set_title('Capacity vs Rs\nSEI growth correlation',
-                  color='#e6edf3', fontsize=12)
-    
-    sc2 = ax2.scatter(Rct_vals, cap_vals, **scatter_kw)
-    ax2.set_xlabel('Rct — Charge Transfer Resistance (Ω)',
-                   color='#e6edf3', fontsize=11)
-    ax2.set_ylabel('Discharge Capacity (Ah)', color='#e6edf3', fontsize=11)
-    ax2.set_title('Capacity vs Rct\nActive material loss correlation',
-                  color='#e6edf3', fontsize=12)
-    
-    for ax, sc in [(ax1, sc1), (ax2, sc2)]:
+
+    colors = {
+        'B0005': '#f97316',
+        'B0006': '#38bdf8',
+        'B0007': '#34d399',
+        'B0018': '#a855f7'
+    }
+
+    for cell_name in all_imp.keys():
+        df_imp = all_imp[cell_name]
+        df_dis = all_dis[cell_name]
+        color  = colors[cell_name]
+
+        # Align: match impedance measurements to
+        # nearest discharge cycle by cycle_index
+        merged_Re  = []
+        merged_Rct = []
+        merged_cap = []
+
+        for _, imp_row in df_imp.iterrows():
+            # Find nearest discharge cycle
+            diffs = (df_dis['cycle_index'] -
+                     imp_row['cycle_index']).abs()
+            nearest = diffs.idxmin()
+            cap = df_dis.loc[nearest, 'capacity_Ah']
+            merged_Re.append(imp_row['Re'])
+            merged_Rct.append(imp_row['Rct'])
+            merged_cap.append(cap)
+
+        axes[0].scatter(merged_Re, merged_cap,
+                        color=color, alpha=0.5,
+                        s=15, label=cell_name)
+        axes[1].scatter(merged_Rct, merged_cap,
+                        color=color, alpha=0.5,
+                        s=15, label=cell_name)
+
+    # EOL threshold
+    for ax in axes:
+        ax.axhline(y=1.4, color='#ef4444',
+                   linestyle='--', linewidth=1.5,
+                   alpha=0.8, label='EOL (1.4 Ah)')
+
+    axes[0].set_xlabel('Re — Electrolyte Resistance (Ohm)',
+                       color='#e6edf3', fontsize=11)
+    axes[0].set_ylabel('Discharge Capacity (Ah)',
+                       color='#e6edf3', fontsize=11)
+    axes[0].set_title('Capacity vs Re\nSEI growth correlation',
+                      color='#e6edf3', fontsize=11)
+
+    axes[1].set_xlabel(
+        'Rct — Charge Transfer Resistance (Ohm)',
+        color='#e6edf3', fontsize=11)
+    axes[1].set_ylabel('Discharge Capacity (Ah)',
+                       color='#e6edf3', fontsize=11)
+    axes[1].set_title(
+        'Capacity vs Rct\nActive material loss correlation',
+        color='#e6edf3', fontsize=11)
+
+    for ax in axes:
         ax.set_facecolor('#0d1117')
         ax.tick_params(colors='#e6edf3')
         for spine in ax.spines.values():
             spine.set_color('#30363d')
-        cbar = plt.colorbar(sc, ax=ax)
-        cbar.set_label('Cycle Number', color='#e6edf3', fontsize=10)
-        cbar.ax.yaxis.set_tick_params(color='#e6edf3')
-        plt.setp(cbar.ax.yaxis.get_ticklabels(), color='#e6edf3')
-    
-    fig.suptitle('Impedance Parameters as Capacity Fade Predictors\n'
-                 'Non-destructive state-of-health estimation for ICD batteries',
-                 color='#e6edf3', fontsize=13, y=1.02)
-    
+        ax.legend(facecolor='#161b22', edgecolor='#30363d',
+                  labelcolor='#e6edf3', fontsize=9)
+
+    fig.suptitle(
+        'Real Impedance vs Capacity Correlation — NASA Data\n'
+        'Non-destructive state-of-health estimation '
+        'for ICD batteries',
+        color='#e6edf3', fontsize=13, y=1.02)
+
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight',
-                facecolor='#0d1117')
+    plt.savefig(output_path, dpi=150,
+                bbox_inches='tight', facecolor='#0d1117')
+    plt.close()
+    print(f"Saved: {output_path}")
+
+
+def plot_bode(all_spec, output_path):
+    """
+    Bode plot: impedance magnitude vs frequency.
+    Uses real NASA impedance spectra.
+    Shows how impedance magnitude increases with aging
+    across the full frequency range.
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    fig.patch.set_facecolor('#0d1117')
+    axes = axes.flatten()
+
+    stage_colors = ['#34d399', '#f97316', '#ef4444']
+    stage_labels = ['Early', 'Mid', 'Late']
+
+    for ax, cell_name in zip(
+            axes, ['B0005', 'B0006', 'B0007', 'B0018']):
+        ax.set_facecolor('#0d1117')
+        spectra = all_spec[cell_name]
+        total = len(spectra)
+
+        indices = [
+            int(total * 0.05),
+            int(total * 0.50),
+            int(total * 0.90)
+        ]
+        indices = [min(i, total - 1) for i in indices]
+
+        for idx, color, label in zip(
+                indices, stage_colors, stage_labels):
+            count, Z_real, Z_imag = spectra[idx]
+            Z_mag = np.sqrt(Z_real**2 + Z_imag**2)
+            # Use index as frequency proxy
+            # (NASA data doesn't store freq array separately)
+            freq_idx = np.arange(len(Z_mag))
+
+            ax.plot(freq_idx, Z_mag,
+                    color=color, linewidth=2.0,
+                    alpha=0.85,
+                    label=f'{label} (meas. {count})')
+
+        ax.set_xlabel('Frequency Index (low to high)',
+                      color='#e6edf3', fontsize=10)
+        ax.set_ylabel('|Z| (Ohm)',
+                      color='#e6edf3', fontsize=10)
+        ax.set_title(
+            f'{cell_name} — Impedance Magnitude',
+            color='#f59e0b', fontsize=11)
+        ax.tick_params(colors='#e6edf3')
+        for spine in ax.spines.values():
+            spine.set_color('#30363d')
+        ax.legend(facecolor='#161b22', edgecolor='#30363d',
+                  labelcolor='#e6edf3', fontsize=8)
+
+    fig.suptitle(
+        'Impedance Magnitude Evolution — Real NASA EIS Data\n'
+        'Overall impedance increases with aging across '
+        'full frequency range\n'
+        'ICD context: rising |Z| reduces available '
+        'energy for defibrillation pulse',
+        color='#e6edf3', fontsize=12, y=1.02)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150,
+                bbox_inches='tight', facecolor='#0d1117')
     plt.close()
     print(f"Saved: {output_path}")
 
@@ -396,54 +458,65 @@ def plot_capacity_vs_impedance(data, output_path):
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    
+
     os.makedirs("outputs", exist_ok=True)
-    
-    print("=" * 55)
-    print("MODULE 2: EIS Analysis — Randles Circuit Fitting")
+
+    print("=" * 60)
+    print("MODULE 2: EIS Analysis — Real NASA PCOE Data")
+    print("B0005, B0006, B0007, B0018 | NASA Ames")
     print("ICD Context: Pre-implant qualification protocol")
-    print("=" * 55)
-    
-    print("\n[1/5] Generating physics-informed EIS dataset...")
-    print("      Calibrated to NASA PCOE B0005-B0018")
-    print("      Degradation rates: Birkl et al. (2017)")
-    data = generate_nasa_eis_dataset(n_cycles=150, cycles_per_measurement=5)
-    print(f"      Generated {len(data)} EIS spectra across 150 cycles")
-    print(f"      Frequency range: 0.01 Hz — 10 kHz (60 points)")
-    
-    # Save parameter evolution to CSV
-    param_df = pd.DataFrame([{
-        'cycle': d['cycle'],
-        'Rs': d['Rs'],
-        'Rct': d['Rct'],
-        'Cdl': d['Cdl'],
-        'W': d['W'],
-        'capacity': d['capacity']
-    } for d in data])
-    param_df.to_csv("data/eis_parameters.csv", index=False)
-    
-    print(f"\n      Rs  : {data[0]['Rs']:.4f} → {data[-1]['Rs']:.4f} Ω "
-          f"(+{(data[-1]['Rs']/data[0]['Rs']-1)*100:.1f}%)")
-    print(f"      Rct : {data[0]['Rct']:.4f} → {data[-1]['Rct']:.4f} Ω "
-          f"(+{(data[-1]['Rct']/data[0]['Rct']-1)*100:.1f}%)")
-    print(f"      Cap : {data[0]['capacity']:.3f} → "
-          f"{data[-1]['capacity']:.3f} Ah")
-    
-    print("\n[2/5] Plotting Nyquist plots...")
-    plot_nyquist(data, "outputs/module2_nyquist.png")
-    
-    print("[3/5] Plotting Bode plots...")
-    plot_bode(data, "outputs/module2_bode.png")
-    
-    print("[4/5] Plotting parameter evolution...")
-    plot_parameter_evolution(data, "outputs/module2_parameter_evolution.png")
-    
-    print("[5/5] Plotting capacity vs impedance correlation...")
-    plot_capacity_vs_impedance(data, "outputs/module2_capacity_vs_impedance.png")
-    
-    print("\n" + "=" * 55)
-    print("MODULE 2 COMPLETE")
-    print(f"Rs increase:  +{(data[-1]['Rs']/data[0]['Rs']-1)*100:.1f}% over 150 cycles")
-    print(f"Rct increase: +{(data[-1]['Rct']/data[0]['Rct']-1)*100:.1f}% over 150 cycles")
-    print("Outputs saved to outputs/")
-    print("=" * 55)
+    print("=" * 60)
+
+    print("\n[1/5] Loading real NASA EIS data...")
+    all_imp, all_dis, all_spec = load_all_eis()
+
+    # Save parameter summary
+    summary_rows = []
+    for cell_name, df in all_imp.items():
+        summary_rows.append({
+            'cell': cell_name,
+            'n_measurements': len(df),
+            'Re_initial': df['Re'].iloc[0],
+            'Re_final': df['Re'].iloc[-1],
+            'Re_increase_pct': (df['Re'].iloc[-1] /
+                                df['Re'].iloc[0] - 1) * 100,
+            'Rct_initial': df['Rct'].iloc[0],
+            'Rct_final': df['Rct'].iloc[-1],
+            'Rct_increase_pct': (df['Rct'].iloc[-1] /
+                                 df['Rct'].iloc[0] - 1) * 100
+        })
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv("data/eis_summary.csv", index=False)
+
+    print("\n  EIS Summary:")
+    for _, row in summary_df.iterrows():
+        print(f"  {row['cell']}: "
+              f"Re +{row['Re_increase_pct']:.1f}% | "
+              f"Rct +{row['Rct_increase_pct']:.1f}%")
+
+    print("\n[2/5] Plotting real Nyquist plots...")
+    plot_nyquist(all_spec, "outputs/module2_nyquist.png")
+
+    print("[3/5] Plotting Re and Rct evolution...")
+    plot_re_rct_evolution(all_imp,
+                          "outputs/module2_parameter_evolution.png")
+
+    print("[4/5] Plotting impedance vs capacity...")
+    plot_impedance_vs_capacity(
+        all_imp, all_dis,
+        "outputs/module2_capacity_vs_impedance.png")
+
+    print("[5/5] Plotting impedance magnitude...")
+    plot_bode(all_spec, "outputs/module2_bode.png")
+
+    print("\n" + "=" * 60)
+    print("MODULE 2 COMPLETE — Real NASA EIS Results")
+    for _, row in summary_df.iterrows():
+        print(f"  {row['cell']}: "
+              f"Re {row['Re_initial']:.4f} -> "
+              f"{row['Re_final']:.4f} Ohm "
+              f"(+{row['Re_increase_pct']:.1f}%) | "
+              f"Rct {row['Rct_initial']:.4f} -> "
+              f"{row['Rct_final']:.4f} Ohm "
+              f"(+{row['Rct_increase_pct']:.1f}%)")
+    print("=" * 60)

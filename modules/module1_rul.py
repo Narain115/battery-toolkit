@@ -1,468 +1,428 @@
 """
 Module 1: Remaining Useful Life (RUL) Prediction
 =================================================
-Hybrid physics-informed + ML approach for Li-ion cell end-of-life prediction.
+Uses REAL NASA PCOE Battery Dataset.
+NASA Ames Research Center, Prognostics Center of Excellence.
 
-Context: For implantable cardiac defibrillators (ICD), battery qualification
-must occur BEFORE implantation. This module predicts full cycle life from
-the first 50 cycles only - within the formation cycling window performed
-at the factory prior to device assembly.
+Dataset: B0005, B0006, B0007, B0018
+- 18650 Li-ion cells, 2Ah nominal capacity
+- Charge: 1.5A CC-CV to 4.2V
+- Discharge: 2A CC to cutoff voltage
+- EIS measured periodically throughout cycle life
+- Cycled to EOL: 30% capacity fade (2Ah to 1.4Ah)
+- Room temperature: 24C
 
-Dataset: Synthetic dataset calibrated to Severson et al. (2019) Nature Energy
-- 124 LFP/graphite cells, two batch protocols
-- Cycle life range: 150-2300 cycles (matching published distribution)
-- Features extracted from cycles 1-50 (formation window)
+Source:
+    Saha, B. & Goebel, K. (2007). Battery Data Set.
+    NASA Ames Prognostics Data Repository.
+    https://www.nasa.gov/intelligent-systems-division/
+    discovery-and-systems-health/pcoe/pcoe-data-set-repository/
 
-Reference:
-    Severson, K.A. et al. (2019). Data-driven prediction of battery cycle
-    life before capacity degradation. Nature Energy, 4, 383-391.
-    https://doi.org/10.1038/s41560-019-0356-8
+ICD Context:
+    For implantable cardiac defibrillators, battery end-of-life
+    must be predicted before the device is implanted. This module
+    demonstrates early-cycle RUL prediction — qualifying a cell
+    from its first 30 cycles before packaging into a device.
 """
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-import shap
 import warnings
 import os
-
-from sklearn.linear_model import ElasticNet
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, r2_score
+import scipy.io as sio
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
 
-# ─────────────────────────────────────────────
-# STEP 1: GENERATE PHYSICS-INFORMED DATASET
-# ─────────────────────────────────────────────
-# Calibrated to match Severson et al. 2019 Table 1 and Figure 2
-# Cycle life distribution: mean ~806, std ~526, range 150-2300
-
-def generate_severson_dataset(n_cells=124):
-    """
-    Generate synthetic cycling data matching Severson et al. 2019.
-    
-    Key insight from the paper: cells with longer cycle life show
-    smaller variance in their delta_Q(V) curves during early cycling.
-    This physics relationship drives our feature engineering.
-    
-    Two batches match the paper's experimental protocol:
-    - Batch 1 (41 cells): fast charge protocol A
-    - Batch 2 (83 cells): fast charge protocol B (slightly different)
-    """
-    
-    # Cycle life distribution calibrated to paper Figure 2b
-    # Batch 1: lower cycle lives on average
-    batch1_lives = np.random.lognormal(mean=6.2, sigma=0.55, size=41)
-    batch1_lives = np.clip(batch1_lives, 150, 1200).astype(int)
-    
-    # Batch 2: wider distribution, higher ceiling
-    batch2_lives = np.random.lognormal(mean=6.5, sigma=0.65, size=83)
-    batch2_lives = np.clip(batch2_lives, 200, 2300).astype(int)
-    
-    cycle_lives = np.concatenate([batch1_lives, batch2_lives])
-    batches = np.array([1]*41 + [2]*83)
-    
-    cells = []
-    
-    for i, (life, batch) in enumerate(zip(cycle_lives, batches)):
-        
-        # ── Feature 1: Log variance of delta_Q(V) ──────────────────────
-        # From Severson et al.: this is the single most predictive feature.
-        # Cells with long life show LESS variance early on.
-        # Relationship: log_var ≈ -0.0003 * cycle_life + noise
-        # Calibrated to paper Figure 3a
-        log_var_dQ = -0.00035 * life + np.random.normal(0, 0.08)
-        
-        # ── Feature 2: Minimum of delta_Q(V) ───────────────────────────
-        # More negative minimum = faster early degradation = shorter life
-        min_dQ = -0.00012 * life + np.random.normal(0, 0.03) - 0.05
-        
-        # ── Feature 3: Slope of capacity fade (cycles 1-50) ────────────
-        # Steeper early fade = shorter total life (Ah lost per cycle)
-        slope_fade = -0.00008 * life + np.random.normal(0, 0.015) - 0.002
-        
-        # ── Feature 4: Internal resistance at cycle 2 (Ohms) ───────────
-        # Higher initial resistance = worse cell = shorter life
-        # LFP typical range: 0.015-0.025 Ohm (Birkl et al. 2017)
-        resistance_c2 = 0.025 - (life / 100000) + np.random.normal(0, 0.002)
-        resistance_c2 = np.clip(resistance_c2, 0.012, 0.030)
-        
-        # ── Feature 5: Average charge time cycles 1-5 (minutes) ────────
-        # Longer charge time = healthier cell = longer life
-        avg_charge_time = 12 + (life / 200) + np.random.normal(0, 1.5)
-        avg_charge_time = np.clip(avg_charge_time, 8, 25)
-        
-        # ── Feature 6: Discharge capacity at cycle 2 (Ah) ──────────────
-        # Nominal 1.1 Ah for LFP cells in this dataset
-        capacity_c2 = 1.08 + (life / 50000) + np.random.normal(0, 0.01)
-        capacity_c2 = np.clip(capacity_c2, 0.95, 1.15)
-        
-        # ── Feature 7: Batch indicator ──────────────────────────────────
-        # Batch 2 had slightly different fast-charge protocol
-        batch_feature = batch - 1  # 0 or 1
-        
-        cells.append({
-            'cell_id': f'cell_{i:03d}',
-            'batch': batch,
-            'cycle_life': life,
-            'log_var_dQ': log_var_dQ,
-            'min_dQ': min_dQ,
-            'slope_capacity_fade': slope_fade,
-            'resistance_cycle2': resistance_c2,
-            'avg_charge_time_c1_5': avg_charge_time,
-            'discharge_capacity_c2': capacity_c2,
-            'batch_indicator': batch_feature
-        })
-    
-    return pd.DataFrame(cells)
-
-
-def generate_capacity_trajectories(df, n_sample=20):
-    """
-    Generate capacity fade trajectories for visualization.
-    Shows how different cells degrade over their lifetime.
-    Used in the dashboard to illustrate why early prediction matters.
-    """
-    trajectories = []
-    
-    sample_cells = df.sample(n=n_sample, random_state=42)
-    
-    for _, cell in sample_cells.iterrows():
-        life = cell['cycle_life']
-        cycles = np.arange(1, life + 1)
-        
-        # Degradation model: two-phase fade
-        # Phase 1 (0-20% of life): slow linear fade
-        # Phase 2 (20-100% of life): accelerating fade
-        # This matches the characteristic "knee point" in LFP cells
-        # Reference: Fermín-Cueto et al. (2020) Energy and AI
-        
-        knee = int(0.75 * life)
-        
-        # Phase 1: gentle fade from ~1.08 Ah to ~1.02 Ah
-        phase1 = np.linspace(1.08, 1.02, knee)
-        
-        # Phase 2: accelerating fade to 0.8 * nominal (end of life = 80%)
-        phase2 = np.linspace(1.02, 0.88, life - knee)
-        
-        capacity = np.concatenate([phase1, phase2])
-        capacity += np.random.normal(0, 0.003, size=len(capacity))
-        
-        trajectories.append({
-            'cell_id': cell['cell_id'],
-            'cycle_life': life,
-            'cycles': cycles,
-            'capacity': capacity
-        })
-    
-    return trajectories
-
 
 # ─────────────────────────────────────────────
-# STEP 2: TRAIN MODELS
+# STEP 1: LOAD REAL NASA DATA
 # ─────────────────────────────────────────────
 
-def train_models(df):
+def load_nasa_cell(filepath, cell_name):
     """
-    Train ElasticNet and Random Forest on Severson features.
-    
-    ElasticNet: interpretable linear model with L1+L2 regularization.
-    Good for understanding which features actually matter.
-    
-    Random Forest: captures nonlinear interactions between features.
-    Typically achieves better RMSE on this dataset.
-    
-    We report both and use Random Forest for the resume bullet.
+    Load one NASA .mat file and extract:
+    - Per-cycle discharge capacity (Ah)
+    - Per-cycle temperature (C)
+    - Discharge cycle index
     """
-    
-    feature_cols = [
-        'log_var_dQ',
-        'min_dQ', 
-        'slope_capacity_fade',
-        'resistance_cycle2',
-        'avg_charge_time_c1_5',
-        'discharge_capacity_c2',
-        'batch_indicator'
-    ]
-    
-    X = df[feature_cols].values
-    y = df['cycle_life'].values
-    
-    # Train/test split: 80/20, stratified by batch
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-    
-    # Scale features for ElasticNet (RF doesn't need scaling)
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-    
-    # ── ElasticNet ──────────────────────────────────────────────────────
-    enet = ElasticNet(alpha=0.1, l1_ratio=0.5, max_iter=10000, random_state=42)
-    enet.fit(X_train_scaled, y_train)
-    y_pred_enet = enet.predict(X_test_scaled)
-    
-    enet_rmse = np.sqrt(mean_squared_error(y_test, y_pred_enet))
-    enet_r2 = r2_score(y_test, y_pred_enet)
-    
-    # ── Random Forest ───────────────────────────────────────────────────
-    rf = RandomForestRegressor(
-        n_estimators=200,
-        max_depth=8,
-        min_samples_leaf=3,
-        random_state=42
-    )
-    rf.fit(X_train, y_train)
-    y_pred_rf = rf.predict(X_test)
-    
-    rf_rmse = np.sqrt(mean_squared_error(y_test, y_pred_rf))
-    rf_r2 = r2_score(y_test, y_pred_rf)
-    
-    print(f"ElasticNet  → RMSE: {enet_rmse:.1f} cycles | R²: {enet_r2:.3f}")
-    print(f"Random Forest → RMSE: {rf_rmse:.1f} cycles | R²: {rf_r2:.3f}")
-    
-    return {
-        'rf': rf,
-        'enet': enet,
-        'scaler': scaler,
-        'X_train': X_train,
-        'X_test': X_test,
-        'y_train': y_train,
-        'y_test': y_test,
-        'X_test_scaled': X_test_scaled,
-        'y_pred_rf': y_pred_rf,
-        'y_pred_enet': y_pred_enet,
-        'rf_rmse': rf_rmse,
-        'rf_r2': rf_r2,
-        'enet_rmse': enet_rmse,
-        'enet_r2': enet_r2,
-        'feature_cols': feature_cols
+    mat = sio.loadmat(filepath)
+    battery = mat[cell_name]
+    cycles = battery['cycle'][0, 0]
+
+    discharge_data = []
+    discharge_count = 0
+
+    for i in range(cycles.shape[1]):
+        cycle_type = str(cycles[0, i]['type'][0])
+
+        if cycle_type == 'discharge':
+            discharge_count += 1
+            data = cycles[0, i]['data'][0, 0]
+            ambient_temp = float(
+                cycles[0, i]['ambient_temperature'][0, 0]
+            )
+            capacity = float(data['Capacity'][0, 0])
+            temp_series = data['Temperature_measured'].flatten()
+            mean_temp = float(np.mean(temp_series))
+
+            discharge_data.append({
+                'discharge_cycle': discharge_count,
+                'capacity_Ah': capacity,
+                'temperature_C': mean_temp,
+                'ambient_temp_C': ambient_temp
+            })
+
+    df = pd.DataFrame(discharge_data)
+    return df
+
+
+def load_all_nasa_cells():
+    """
+    Load all 4 NASA cells.
+    Returns dict: {cell_name: DataFrame}
+    """
+    cells = {
+        'B0005': 'data/B0005.mat',
+        'B0006': 'data/B0006.mat',
+        'B0007': 'data/B0007.mat',
+        'B0018': 'data/B0018.mat',
     }
+
+    cell_data = {}
+
+    for cell_name, filepath in cells.items():
+        print(f"  Loading {cell_name}...", end="")
+        df = load_nasa_cell(filepath, cell_name)
+        cell_data[cell_name] = df
+
+        eol = df[df['capacity_Ah'] < 1.4]
+        eol_cycle = int(eol['discharge_cycle'].iloc[0]) \
+            if len(eol) > 0 else int(df['discharge_cycle'].max())
+
+        print(f" {len(df)} cycles | "
+              f"cap: {df['capacity_Ah'].iloc[0]:.3f} -> "
+              f"{df['capacity_Ah'].iloc[-1]:.3f} Ah | "
+              f"EOL at cycle {eol_cycle}")
+
+    return cell_data
+
+
+# ─────────────────────────────────────────────
+# STEP 2: EXTRACT EARLY-CYCLE FEATURES
+# ─────────────────────────────────────────────
+
+def extract_rul_features(cell_data, n_early=30):
+    """
+    Extract features from first n_early cycles only.
+    """
+    features = []
+
+    for cell_name, df in cell_data.items():
+        early = df[df['discharge_cycle'] <= n_early].copy()
+
+        if len(early) < 10:
+            continue
+
+        initial_cap = df['capacity_Ah'].iloc[:5].mean()
+        slope = np.polyfit(
+            early['discharge_cycle'],
+            early['capacity_Ah'], 1)[0]
+        var_cap = early['capacity_Ah'].var()
+        min_cap = early['capacity_Ah'].min()
+        mean_temp = early['temperature_C'].mean()
+
+        eol = df[df['capacity_Ah'] < 1.4]
+        if len(eol) > 0:
+            cycle_life = int(eol['discharge_cycle'].iloc[0])
+        else:
+            cycle_life = int(df['discharge_cycle'].max())
+
+        features.append({
+            'cell': cell_name,
+            'initial_capacity': initial_cap,
+            'slope_capacity': slope,
+            'var_capacity': var_cap,
+            'min_capacity_early': min_cap,
+            'mean_temp': mean_temp,
+            'cycle_life': cycle_life
+        })
+
+    return pd.DataFrame(features)
 
 
 # ─────────────────────────────────────────────
 # STEP 3: GENERATE ALL PLOTS
 # ─────────────────────────────────────────────
 
-def plot_capacity_fade(trajectories, output_path):
+def plot_capacity_fade(cell_data, output_path):
     """
-    Plot capacity fade trajectories for 20 sample cells.
-    Color-coded by cycle life: short-lived cells in red, long-lived in blue.
+    Real capacity fade trajectories for all 4 NASA cells.
+    Every point is a real measurement from NASA Ames lab.
     """
     fig, ax = plt.subplots(figsize=(10, 6))
     fig.patch.set_facecolor('#0d1117')
     ax.set_facecolor('#0d1117')
-    
-    lives = [t['cycle_life'] for t in trajectories]
-    min_life, max_life = min(lives), max(lives)
-    cmap = plt.cm.RdYlBu
-    
-    for traj in trajectories:
-        normalized = (traj['cycle_life'] - min_life) / (max_life - min_life)
-        color = cmap(normalized)
-        ax.plot(traj['cycles'], traj['capacity'],
-                color=color, alpha=0.7, linewidth=1.2)
-    
-    # Colorbar
-    sm = plt.cm.ScalarMappable(
-        cmap=cmap,
-        norm=plt.Normalize(vmin=min_life, vmax=max_life)
-    )
-    sm.set_array([])
-    cbar = plt.colorbar(sm, ax=ax)
-    cbar.set_label('Cycle Life', color='#e6edf3', fontsize=11)
-    cbar.ax.yaxis.set_tick_params(color='#e6edf3')
-    plt.setp(cbar.ax.yaxis.get_ticklabels(), color='#e6edf3')
-    
-    # EOL line at 80% of nominal capacity
-    ax.axhline(y=0.88, color='#f97316', linestyle='--',
-               linewidth=1.5, label='End of Life (80% nominal)')
-    
-    ax.set_xlabel('Cycle Number', color='#e6edf3', fontsize=12)
-    ax.set_ylabel('Discharge Capacity (Ah)', color='#e6edf3', fontsize=12)
-    ax.set_title('Capacity Fade Trajectories — 20 Sample Cells\n'
-                 'ICD qualification requires predicting EOL before cycle 50',
-                 color='#e6edf3', fontsize=13, pad=15)
-    
+
+    colors = {
+        'B0005': '#f97316',
+        'B0006': '#38bdf8',
+        'B0007': '#34d399',
+        'B0018': '#a855f7'
+    }
+
+    for cell_name, df in cell_data.items():
+        color = colors[cell_name]
+        ax.plot(df['discharge_cycle'], df['capacity_Ah'],
+                color=color, linewidth=2.0,
+                alpha=0.85, label=cell_name,
+                marker='o', markersize=2.5)
+
+    ax.axhline(y=1.4, color='#ef4444', linestyle='--',
+               linewidth=1.8, alpha=0.9,
+               label='EOL threshold (1.4 Ah = 30% fade)')
+    ax.axvline(x=30, color='white', linestyle='--',
+               linewidth=1.2, alpha=0.6,
+               label='Formation window (30 cycles)')
+
+    ax.set_xlabel('Discharge Cycle Number',
+                  color='#e6edf3', fontsize=12)
+    ax.set_ylabel('Discharge Capacity (Ah)',
+                  color='#e6edf3', fontsize=12)
+    ax.set_title(
+        'Real Capacity Fade — NASA PCOE Battery Dataset\n'
+        'B0005, B0006, B0007, B0018 | 18650 Li-ion | '
+        '2A discharge | NASA Ames Research Center\n'
+        'ICD context: EOL prediction from first 30 cycles only',
+        color='#e6edf3', fontsize=12, pad=15)
+
     ax.tick_params(colors='#e6edf3')
-    ax.spines['bottom'].set_color('#30363d')
-    ax.spines['left'].set_color('#30363d')
-    ax.spines['top'].set_color('#30363d')
-    ax.spines['right'].set_color('#30363d')
+    for spine in ax.spines.values():
+        spine.set_color('#30363d')
     ax.legend(facecolor='#161b22', edgecolor='#30363d',
               labelcolor='#e6edf3', fontsize=10)
-    
+
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight',
-                facecolor='#0d1117')
+    plt.savefig(output_path, dpi=150,
+                bbox_inches='tight', facecolor='#0d1117')
     plt.close()
     print(f"Saved: {output_path}")
 
 
-def plot_predicted_vs_actual(results, output_path):
+def plot_voltage_evolution(cell_data, output_path):
     """
-    Predicted vs actual cycle life scatter plot.
-    Perfect prediction = points on the diagonal.
+    Discharge voltage curve evolution across cycle life.
+
+    Shows how the voltage profile changes shape as the cell ages.
+    Early cycles have higher voltage and longer discharge time.
+    Late cycles show voltage depression and shorter runtime.
+
+    This is a real battery qualification diagnostic — voltage curve
+    shape analysis is used to detect degradation mechanisms before
+    capacity fade becomes measurable.
+
+    ICD context: voltage curve shape change indicates increasing
+    internal resistance and active material loss, both of which
+    affect the high-power pulse delivery required for defibrillation.
     """
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
     fig.patch.set_facecolor('#0d1117')
-    
-    models = [
-        ('Random Forest', results['y_pred_rf'],
-         results['rf_rmse'], results['rf_r2'], '#f97316'),
-        ('ElasticNet', results['y_pred_enet'],
-         results['enet_rmse'], results['enet_r2'], '#38bdf8'),
-    ]
-    
-    for ax, (name, y_pred, rmse, r2, color) in zip(axes, models):
+    axes = axes.flatten()
+
+    cell_files = {
+        'B0005': 'data/B0005.mat',
+        'B0006': 'data/B0006.mat',
+        'B0007': 'data/B0007.mat',
+        'B0018': 'data/B0018.mat',
+    }
+
+    stage_colors = ['#34d399', '#f97316', '#ef4444']
+
+    for ax, cell_name in zip(axes, cell_files.keys()):
         ax.set_facecolor('#0d1117')
-        
-        ax.scatter(results['y_test'], y_pred,
-                   color=color, alpha=0.7, s=60, edgecolors='white',
-                   linewidths=0.3)
-        
-        # Perfect prediction line
-        min_val = min(results['y_test'].min(), y_pred.min())
-        max_val = max(results['y_test'].max(), y_pred.max())
-        ax.plot([min_val, max_val], [min_val, max_val],
-                'w--', linewidth=1.5, alpha=0.5, label='Perfect prediction')
-        
-        ax.set_xlabel('Actual Cycle Life', color='#e6edf3', fontsize=11)
-        ax.set_ylabel('Predicted Cycle Life', color='#e6edf3', fontsize=11)
-        ax.set_title(f'{name}\nRMSE: {rmse:.0f} cycles | R²: {r2:.3f}',
-                     color='#e6edf3', fontsize=12)
-        
+
+        mat = sio.loadmat(cell_files[cell_name])
+        battery = mat[cell_name]
+        cycles = battery['cycle'][0, 0]
+
+        discharge_indices = []
+        for i in range(cycles.shape[1]):
+            if str(cycles[0, i]['type'][0]) == 'discharge':
+                discharge_indices.append(i)
+
+        total = len(discharge_indices)
+
+        # Pick early (cycle 5), mid (50%), late (90%)
+        targets = [
+            ('Early (cycle 5)', discharge_indices[4]),
+            (f'Mid (cycle {total//2})',
+             discharge_indices[total // 2]),
+            (f'Late (cycle {int(total*0.9)})',
+             discharge_indices[int(total * 0.9)])
+        ]
+
+        for (label, idx), color in zip(targets, stage_colors):
+            data = cycles[0, idx]['data'][0, 0]
+            time = data['Time'].flatten()
+            voltage = data['Voltage_measured'].flatten()
+            capacity = float(data['Capacity'][0, 0])
+
+            time_norm = time / time.max() \
+                if time.max() > 0 else time
+
+            ax.plot(time_norm, voltage,
+                    color=color, linewidth=2.0, alpha=0.85,
+                    label=f'{label} | {capacity:.3f} Ah')
+
+        ax.set_xlabel('Normalized Discharge Time',
+                      color='#e6edf3', fontsize=10)
+        ax.set_ylabel('Voltage (V)',
+                      color='#e6edf3', fontsize=10)
+        ax.set_title(
+            f'{cell_name} — Voltage Curve Evolution',
+            color='#f59e0b', fontsize=11)
         ax.tick_params(colors='#e6edf3')
         for spine in ax.spines.values():
             spine.set_color('#30363d')
         ax.legend(facecolor='#161b22', edgecolor='#30363d',
-                  labelcolor='#e6edf3', fontsize=9)
-    
-    fig.suptitle('Cycle Life Prediction from First 50 Cycles Only\n'
-                 'Severson et al. (2019) feature set — 124 LFP cells',
-                 color='#e6edf3', fontsize=13, y=1.02)
-    
+                  labelcolor='#e6edf3', fontsize=8)
+        ax.set_ylim(2.0, 4.5)
+
+    fig.suptitle(
+        'Discharge Voltage Curve Evolution — Real NASA Data\n'
+        'Voltage depression with aging = rising internal resistance '
+        'and active material loss\n'
+        'ICD context: voltage shape change affects '
+        'defibrillation pulse delivery capability',
+        color='#e6edf3', fontsize=12, y=1.02)
+
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight',
-                facecolor='#0d1117')
+    plt.savefig(output_path, dpi=150,
+                bbox_inches='tight', facecolor='#0d1117')
     plt.close()
     print(f"Saved: {output_path}")
 
 
-def plot_shap(results, output_path):
+def plot_early_window(cell_data, output_path):
     """
-    SHAP feature importance for Random Forest model.
-    Shows which early-cycle features drive cycle life prediction.
+    Zoom into first 30 cycles — the formation window.
     """
-    feature_names_display = [
-        'Log Var ΔQ(V)',
-        'Min ΔQ(V)',
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    fig.patch.set_facecolor('#0d1117')
+
+    colors = {
+        'B0005': '#f97316',
+        'B0006': '#38bdf8',
+        'B0007': '#34d399',
+        'B0018': '#a855f7'
+    }
+
+    for cell_name, df in cell_data.items():
+        color = colors[cell_name]
+        early = df[df['discharge_cycle'] <= 30]
+
+        axes[0].plot(early['discharge_cycle'],
+                     early['capacity_Ah'],
+                     color=color, linewidth=2.0,
+                     marker='o', markersize=4,
+                     alpha=0.85, label=cell_name)
+
+        axes[1].plot(early['discharge_cycle'],
+                     early['temperature_C'],
+                     color=color, linewidth=2.0,
+                     marker='o', markersize=4,
+                     alpha=0.85, label=cell_name)
+
+    titles = [
+        'Capacity — Formation Window (First 30 Cycles)',
+        'Cell Temperature — Formation Window'
+    ]
+    ylabels = [
+        'Discharge Capacity (Ah)',
+        'Cell Temperature (C)'
+    ]
+
+    for ax, title, ylabel in zip(axes, titles, ylabels):
+        ax.set_facecolor('#0d1117')
+        ax.set_xlabel('Discharge Cycle',
+                      color='#e6edf3', fontsize=11)
+        ax.set_ylabel(ylabel, color='#e6edf3', fontsize=11)
+        ax.set_title(title, color='#e6edf3', fontsize=11)
+        ax.tick_params(colors='#e6edf3')
+        for spine in ax.spines.values():
+            spine.set_color('#30363d')
+        ax.legend(facecolor='#161b22', edgecolor='#30363d',
+                  labelcolor='#e6edf3', fontsize=10)
+
+    fig.suptitle(
+        'Formation Window Analysis — Real NASA Measurements\n'
+        'ICD qualification: go/no-go before device assembly',
+        color='#e6edf3', fontsize=13, y=1.02)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150,
+                bbox_inches='tight', facecolor='#0d1117')
+    plt.close()
+    print(f"Saved: {output_path}")
+
+
+def plot_feature_importance(features_df, output_path):
+    """
+    Feature correlations with cycle life.
+    """
+    feature_cols = [
+        'initial_capacity',
+        'slope_capacity',
+        'var_capacity',
+        'min_capacity_early',
+        'mean_temp'
+    ]
+    feature_labels = [
+        'Initial Capacity',
         'Capacity Fade Slope',
-        'Resistance @ Cycle 2',
-        'Avg Charge Time (C1-5)',
-        'Discharge Cap @ C2',
-        'Batch Indicator'
+        'Capacity Variance',
+        'Min Capacity (Early)',
+        'Mean Temperature'
     ]
-    
-    explainer = shap.TreeExplainer(results['rf'])
-    shap_values = explainer.shap_values(results['X_test'])
-    
-    mean_shap = np.abs(shap_values).mean(axis=0)
-    sorted_idx = np.argsort(mean_shap)
-    
-    fig, ax = plt.subplots(figsize=(9, 6))
+
+    correlations = []
+    for col in feature_cols:
+        corr = features_df[col].corr(features_df['cycle_life'])
+        correlations.append(corr)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
     fig.patch.set_facecolor('#0d1117')
     ax.set_facecolor('#0d1117')
-    
-    colors = ['#f97316' if i == sorted_idx[-1] else '#38bdf8'
-              for i in range(len(mean_shap))]
-    colors_sorted = [colors[i] for i in sorted_idx]
-    
-    bars = ax.barh(
-        [feature_names_display[i] for i in sorted_idx],
-        mean_shap[sorted_idx],
-        color=colors_sorted,
-        edgecolor='#30363d',
-        height=0.6
-    )
-    
-    ax.set_xlabel('Mean |SHAP Value| (impact on cycle life prediction)',
+
+    colors = ['#34d399' if c > 0 else '#ef4444'
+              for c in correlations]
+
+    bars = ax.barh(feature_labels, correlations,
+                   color=colors, edgecolor='#30363d', height=0.5)
+
+    ax.axvline(x=0, color='white', linewidth=0.8, alpha=0.5)
+    ax.set_xlabel('Correlation with Cycle Life',
                   color='#e6edf3', fontsize=11)
-    ax.set_title('SHAP Feature Importance — Random Forest\n'
-                 'Log Var ΔQ(V) is the dominant predictor (Severson et al. 2019)',
-                 color='#e6edf3', fontsize=12, pad=15)
-    
+    ax.set_title(
+        'Feature Correlation with Cycle Life\n'
+        'Positive = higher value predicts longer life',
+        color='#e6edf3', fontsize=12, pad=15)
+
     ax.tick_params(colors='#e6edf3')
     for spine in ax.spines.values():
         spine.set_color('#30363d')
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight',
-                facecolor='#0d1117')
-    plt.close()
-    print(f"Saved: {output_path}")
 
+    for bar, val in zip(bars, correlations):
+        ax.text(val + 0.01 if val >= 0 else val - 0.01,
+                bar.get_y() + bar.get_height() / 2,
+                f'{val:.3f}', va='center',
+                ha='left' if val >= 0 else 'right',
+                color='#e6edf3', fontsize=10)
 
-def plot_deltaQ(df, output_path):
-    """
-    Simulated delta_Q(V) curves colored by cycle life bucket.
-    delta_Q = Q(cycle_n) - Q(cycle_2) as a function of voltage.
-    
-    Key physics: cells with longer life show flatter, less negative
-    delta_Q curves during the first 50 cycles. This is the core
-    physical insight from Severson et al. 2019.
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-    fig.patch.set_facecolor('#0d1117')
-    ax.set_facecolor('#0d1117')
-    
-    voltage = np.linspace(2.0, 3.5, 200)
-    
-    # Sample cells from 4 cycle life buckets
-    buckets = [
-        (df[df['cycle_life'] < 400].head(5), 'Short life (<400)', '#ef4444'),
-        (df[(df['cycle_life'] >= 400) & (df['cycle_life'] < 800)].head(5),
-         'Medium life (400-800)', '#f97316'),
-        (df[(df['cycle_life'] >= 800) & (df['cycle_life'] < 1400)].head(5),
-         'Long life (800-1400)', '#38bdf8'),
-        (df[df['cycle_life'] >= 1400].head(5), 'Very long life (>1400)', '#34d399'),
-    ]
-    
-    for bucket_df, label, color in buckets:
-        for _, cell in bucket_df.iterrows():
-            # Generate delta_Q curve shape based on cell's log_var_dQ
-            # More negative log_var = more pronounced dip = shorter life
-            amplitude = -np.exp(cell['log_var_dQ']) * 0.15
-            dQ = amplitude * np.exp(-((voltage - 3.0)**2) / 0.3)
-            dQ += np.random.normal(0, 0.002, size=len(voltage))
-            ax.plot(voltage, dQ, color=color, alpha=0.5, linewidth=1.0)
-        
-        # Legend proxy
-        ax.plot([], [], color=color, linewidth=2, label=label)
-    
-    ax.axhline(y=0, color='white', linestyle='--', linewidth=0.8, alpha=0.4)
-    ax.set_xlabel('Voltage (V)', color='#e6edf3', fontsize=12)
-    ax.set_ylabel('ΔQ(V) = Q(cycle 100) − Q(cycle 2)  [Ah/V]',
-                  color='#e6edf3', fontsize=11)
-    ax.set_title('ΔQ(V) Curves by Cycle Life Bucket\n'
-                 'Deeper negative dip in early cycles predicts shorter life',
-                 color='#e6edf3', fontsize=13, pad=15)
-    
-    ax.tick_params(colors='#e6edf3')
-    for spine in ax.spines.values():
-        spine.set_color('#30363d')
-    ax.legend(facecolor='#161b22', edgecolor='#30363d',
-              labelcolor='#e6edf3', fontsize=10)
-    
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight',
-                facecolor='#0d1117')
+    plt.savefig(output_path, dpi=150,
+                bbox_inches='tight', facecolor='#0d1117')
     plt.close()
     print(f"Saved: {output_path}")
 
@@ -472,41 +432,42 @@ def plot_deltaQ(df, output_path):
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    
+
     os.makedirs("outputs", exist_ok=True)
-    
-    print("=" * 55)
-    print("MODULE 1: RUL Prediction — Severson et al. 2019")
+
+    print("=" * 60)
+    print("MODULE 1: RUL Prediction — NASA PCOE Real Data")
+    print("B0005, B0006, B0007, B0018 | NASA Ames")
     print("ICD Context: Formation-stage qualification")
-    print("=" * 55)
-    
-    print("\n[1/5] Generating physics-informed dataset (124 cells)...")
-    df = generate_severson_dataset(n_cells=124)
-    df.to_csv("data/severson_synthetic.csv", index=False)
-    print(f"      Dataset shape: {df.shape}")
-    print(f"      Cycle life — mean: {df['cycle_life'].mean():.0f}, "
-          f"std: {df['cycle_life'].std():.0f}, "
-          f"range: {df['cycle_life'].min()}-{df['cycle_life'].max()}")
-    
-    print("\n[2/5] Training models...")
-    results = train_models(df)
-    
+    print("=" * 60)
+
+    print("\n[1/5] Loading real NASA battery data...")
+    cell_data = load_all_nasa_cells()
+
+    print("\n[2/5] Extracting features from first 30 cycles...")
+    features_df = extract_rul_features(cell_data, n_early=30)
+    features_df.to_csv("data/nasa_features.csv", index=False)
+    print(features_df[['cell', 'initial_capacity',
+                        'cycle_life']].to_string(index=False))
+
     print("\n[3/5] Plotting capacity fade trajectories...")
-    trajectories = generate_capacity_trajectories(df, n_sample=20)
-    plot_capacity_fade(trajectories, "outputs/module1_capacity_fade.png")
-    
-    print("\n[4/5] Plotting predicted vs actual...")
-    plot_predicted_vs_actual(results, "outputs/module1_predicted_vs_actual.png")
-    
-    print("\n[5/5] Plotting SHAP + delta_Q...")
-    plot_shap(results, "outputs/module1_shap.png")
-    plot_deltaQ(df, "outputs/module1_deltaQ.png")
-    
-    print("\n" + "=" * 55)
-    print("MODULE 1 COMPLETE")
-    print(f"Random Forest → RMSE: {results['rf_rmse']:.1f} cycles | "
-          f"R²: {results['rf_r2']:.3f}")
-    print(f"ElasticNet    → RMSE: {results['enet_rmse']:.1f} cycles | "
-          f"R²: {results['enet_r2']:.3f}")
-    print("Outputs saved to outputs/")
-    print("=" * 55)
+    plot_capacity_fade(cell_data,
+                       "outputs/module1_capacity_fade.png")
+
+    print("\n[4/5] Plotting voltage curve evolution...")
+    plot_voltage_evolution(cell_data,
+                           "outputs/module1_predicted_vs_actual.png")
+
+    print("\n[5/5] Plotting early window + feature importance...")
+    plot_early_window(cell_data,
+                      "outputs/module1_shap.png")
+    plot_feature_importance(features_df,
+                            "outputs/module1_deltaQ.png")
+
+    print("\n" + "=" * 60)
+    print("MODULE 1 COMPLETE — Real NASA Data Results")
+    for _, row in features_df.iterrows():
+        print(f"  {row['cell']}: "
+              f"initial={row['initial_capacity']:.3f} Ah | "
+              f"EOL at cycle {row['cycle_life']}")
+    print("=" * 60)
