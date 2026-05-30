@@ -59,9 +59,19 @@ with st.sidebar:
         "defibrillators (ICD) at Purdue University."
     )
     st.markdown("---")
-    st.markdown(
+st.markdown(
         "[![GitHub](https://img.shields.io/badge/GitHub-Narain115-f59e0b?"
         "style=flat&logo=github)](https://github.com/Narain115/battery-toolkit)"
+    )
+    st.markdown("---")
+    st.markdown("**Data Source**")
+    st.markdown(
+        "[NASA PCOE Battery Dataset](https://www.nasa.gov/intelligent-systems-division/"
+        "discovery-and-systems-health/pcoe/pcoe-data-set-repository/)"
+    )
+    st.markdown(
+        "[Dataset README](https://github.com/Narain115/battery-toolkit/blob/master/"
+        "README_NASA_B0005_B0006_B0007_B0018.txt)"
     )
 
 
